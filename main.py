@@ -1,11 +1,9 @@
 import sys
 import gi
 from libs.platform import PlatformInfo
-import ctypes
-import configparser
-import time
-import os
 from loguru import logger
+import math
+import pyds
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GObject, GLib
@@ -58,22 +56,22 @@ def cb_newpad(decodebin, decoder_src_pad, data):
             logger.error("Error: Decodebin did not pick nvidia decoder plugin.")
 
 
-def decodebin_child_added(child_proxy, Object, name, user_data):
+def decodebin_child_added(child_proxy, obj, name, user_data):
     logger.info("Decodebin child added: {0}".format(name))
     if name.find("decodebin") != -1:
-        Object.connect("child-added", decodebin_child_added, user_data)
+        obj.connect("child-added", decodebin_child_added, user_data)
 
     if not platform_info.is_integrated_gpu() and name.find("nvv4l2decoder") != -1:
         # Use CUDA unified memory in the pipeline so frames can be easily accessed on CPU in Python.
         # 0: NVBUF_MEM_CUDA_DEVICE, 1: NVBUF_MEM_CUDA_PINNED, 2: NVBUF_MEM_CUDA_UNIFIED
         # Dont use direct macro here like NVBUF_MEM_CUDA_UNIFIED since nvv4l2decoder uses a
         # different enum internally
-        Object.set_property("cudadec-memtype", 2)
+        obj.set_property("cudadec-memtype", 2)
 
     if "source" in name:
         source_element = child_proxy.get_by_name("source")
         if source_element.find_property("drop-on-latency") != None:
-            Object.set_property("drop-on-latency", True)
+            obj.set_property("drop-on-latency", True)
 
 
 def create_source_bin(index, uri):
@@ -106,7 +104,7 @@ def create_source_bin(index, uri):
     # Once the decode bin creates the video decoder and provides the src pad, we will
     # set the ghost pad target to the video decoder src pad.
 
-    Gst.bin.add(nbin, uri_decode_bin)
+    Gst.Bin.add(nbin, uri_decode_bin)
     bin_pad = nbin.add_pad(Gst.GhostPad.new_no_target("src", Gst.PadDirection.SRC))
     if not bin_pad:
         logger.error("Failed to add ghost pad in source bin")
@@ -122,7 +120,8 @@ def main(args):
         )
         sys.exit(1)
 
-    number_sources = len(args) - 2
+    number_sources = len(args) - 1
+    logger.info(f"Number of sources: {number_sources}")
     # Standard GStreamer initialization
     Gst.init(None)
 
@@ -162,139 +161,146 @@ def main(args):
         srcpad.link(sinkpad)
 
     logger.info("Creating PGIE")
-
-    # if input_uri.startswith("rtsp://"):
-    #     # RTSP Source
-    #     source = Gst.ElementFactory.make("rtspsrc", "rtsp-source")
-    #     source.set_property("location", input_uri)
-    #     source.set_property("latency", 200)
-    #
-    #     depay = Gst.ElementFactory.make("rtph264depay", "rtp-depay")
-    #     h264parser = Gst.ElementFactory.make("h264parse", "h264-parser")
-    #     decoder = Gst.ElementFactory.make("nvv4l2decoder", "nvv4l2-decoder")
-    # else:
-    #     # File Source
-    #     source = Gst.ElementFactory.make("filesrc", "file-source")
-    #     source.set_property("location", input_uri)
-    #
-    #     demuxer = Gst.ElementFactory.make("qtdemux", "qt-demuxer")
-    #     h264parser = Gst.ElementFactory.make("h264parse", "h264-parser")
-    #     decoder = Gst.ElementFactory.make("nvv4l2decoder", "nvv4l2-decoder")
-
-    # Stream Muxer
-    streammux = Gst.ElementFactory.make("nvstreammux", "stream-muxer")
-    streammux.set_property("width", 1920)
-    streammux.set_property("height", 1080)
-    streammux.set_property("batch-size", 1)
-    streammux.set_property("batched-push-timeout", 40000)
-
-    # Primary Inference
     pgie = Gst.ElementFactory.make("nvinfer", "primary-inference")
     if not pgie:
-        sys.stderr.write("Unable to create pgie\n")
-    pgie.set_property("config-file-path", "yolov5.txt")
+        sys.stderr.write(" Unable to create pgie \n")
 
-    # OSD
-    nvdsosd = Gst.ElementFactory.make("nvdsosd", "onscreendisplay")
+    # add nvvidconv1 and filter1 to convert frames to RGBA
+    # which is easier to work with in Python.
+    logger.info("Creating nvvidconv1")
+    nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")
+    if not nvvidconv1:
+        sys.stderr.write(" Unable to create nvvidconv1 \n")
 
-    # Encoder and Muxer
-    encoder = Gst.ElementFactory.make("nvv4l2h264enc", "h264-encoder")
+    logger.info("Creating filter1")
+    caps1 = Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
+    filter1 = Gst.ElementFactory.make("capsfilter", "filter1")
+    if not filter1:
+        sys.stderr.write(" Unable to create filter1 \n")
+    filter1.set_property("caps", caps1)
+    logger.info("creating tiler")
+
+    logger.info("Creating nvvidconv")
+    nvvidconv = Gst.ElementFactory.make("nvvideoconvert", "convertor")
+    if not nvvidconv:
+        sys.stderr.write(" Unable to create nvvidconv \n")
+
+    logger.info("Creating nvosd")
+    nvosd = Gst.ElementFactory.make("nvdsosd", "onscreendisplay")
+    if not nvosd:
+        sys.stderr.write(" Unable to create nvosd \n")
+
+    nvvidconv_postosd = Gst.ElementFactory.make("nvvideoconvert", "convertor_postosd")
+    if not nvvidconv_postosd:
+        sys.stderr.write(" Unable to create nvvidconv_postosd \n")
+
+    # create caps filter
+    caps = Gst.ElementFactory.make("capsfilter", "filter")
+    caps.set_property(
+        "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12")
+    )
+    # caps.set_property(
+    #     "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
+    # )
+
+    # make the encoder
+    encoder = Gst.ElementFactory.make("nvv4l2h264enc", "encoder")
     encoder.set_property("bitrate", 4000000)
-    codeparser = Gst.ElementFactory.make("h264parse", "h264-parser2")
-    container = Gst.ElementFactory.make("qtmux", "qt-muxer")
+    if platform_info.is_integrated_gpu():
+        encoder.set_property("preset-level", 1)
+        encoder.set_property("insert-sps-pps", 1)
 
-    # Sink
+    streammux.set_property("width", 1920)
+    streammux.set_property("height", 1080)
+    streammux.set_property("batch-size", number_sources)
+    streammux.set_property("batched-push-timeout", 4000000)
+
+    pgie.set_property("config-file-path", "yolov5.txt")
+    pgie_batch_size = pgie.get_property("batch-size")
+    if pgie_batch_size != number_sources:
+        logger.error(
+            f"WARNING: Overriding infer-config batch-size ({pgie_batch_size}) with number of sources ({number_sources})"
+        )
+        pgie.set_property("batch-size", number_sources)
+
+    tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
+    if not tiler:
+        sys.stderr.write(" Unable to create tiler \n")
+
+    tiler_rows = max(1, int(math.sqrt(number_sources)))
+    tiler_columns = max(1, int(math.ceil((1.0 * number_sources) / tiler_rows)))
+
+    tiler.set_property("rows", tiler_rows)
+    tiler.set_property("columns", tiler_columns)
+    tiler.set_property("width", 1920)
+    tiler.set_property("height", 1080)
+
     sink = Gst.ElementFactory.make("filesink", "file-sink")
     sink.set_property("location", "output.mp4")
     sink.set_property("sync", False)
     sink.set_property("async", False)
 
-    # Check if all elements are created
-    elements = [
-        source,
-        decoder,
-        streammux,
-        pgie,
-        nvdsosd,
-        encoder,
-        codeparser,
-        container,
-        sink,
-    ]
+    if not platform_info.is_integrated_gpu():
+        # Use CUDA unified memory in the pipeline so frames
+        # can be easily accessed on CPU in Python.
+        mem_type = int(pyds.NVBUF_MEM_CUDA_UNIFIED)
+        streammux.set_property("nvbuf-memory-type", mem_type)
+        nvvidconv.set_property("nvbuf-memory-type", mem_type)
+        nvvidconv1.set_property("nvbuf-memory-type", mem_type)
+        tiler.set_property("nvbuf-memory-type", mem_type)
+        nvvidconv_postosd.set_property("nvbuf-memory-type", mem_type)
 
-    if input_uri.startswith("rtsp://"):
-        elements.extend([depay, h264parser])
-    else:
-        elements.extend([demuxer, h264parser])
+    h264parse = Gst.ElementFactory.make("h264parse", "h264-parser")
+    if not h264parse:
+        sys.stderr.write(" Unable to create h264parse \n")
 
-    for elem in elements:
-        if not elem:
-            sys.stderr.write("Unable to create element: {}\n".format(elem))
-            sys.exit(1)
+    qtmux = Gst.ElementFactory.make("qtmux", "qtmux")
+    if not qtmux:
+        sys.stderr.write(" Unable to create qtmux \n")
 
-    # Add elements to the pipeline
-    pipeline.add(streammux)
+    print("Adding elements to Pipeline \n")
     pipeline.add(pgie)
-    pipeline.add(nvdsosd)
+    pipeline.add(tiler)
+    pipeline.add(nvvidconv)
+    pipeline.add(filter1)
+    pipeline.add(nvvidconv1)
+    pipeline.add(nvosd)
+    pipeline.add(nvvidconv_postosd)
+    pipeline.add(caps)
     pipeline.add(encoder)
-    pipeline.add(codeparser)
-    pipeline.add(container)
+    pipeline.add(h264parse)
+    pipeline.add(qtmux)
     pipeline.add(sink)
 
-    if input_uri.startswith("rtsp://"):
-        pipeline.add(source)
-        pipeline.add(depay)
-        pipeline.add(h264parser)
-        pipeline.add(decoder)
-    else:
-        pipeline.add(source)
-        pipeline.add(demuxer)
-        pipeline.add(h264parser)
-        pipeline.add(decoder)
-
-    # Link the elements
-    if input_uri.startswith("rtsp://"):
-        source.connect("pad-added", on_rtsp_pad_added, depay)
-        depay.link(h264parser)
-        h264parser.link(decoder)
-    else:
-        demuxer.connect("pad-added", on_demux_pad_added, h264parser)
-        source.link(demuxer)
-        h264parser.link(decoder)
-
-    sinkpad = streammux.get_request_pad("sink_0")
-    if not sinkpad:
-        sys.stderr.write("Unable to get sink pad of streammux\n")
-        sys.exit(1)
-
-    srcpad = decoder.get_static_pad("src")
-    if not srcpad:
-        sys.stderr.write("Unable to get src pad of decoder\n")
-        sys.exit(1)
-
-    srcpad.link(sinkpad)
-
+    print("Linking elements in the Pipeline \n")
     streammux.link(pgie)
-    pgie.link(nvdsosd)
-    nvdsosd.link(encoder)
-    encoder.link(codeparser)
-    codeparser.link(container)
-    container.link(sink)
+    pgie.link(nvvidconv1)
+    nvvidconv1.link(filter1)
+    filter1.link(tiler)
+    tiler.link(nvvidconv)
+    nvvidconv.link(nvosd)
+    nvosd.link(nvvidconv_postosd)
+    nvvidconv_postosd.link(caps)
+    caps.link(encoder)
+    encoder.link(h264parse)
+    h264parse.link(qtmux)
+    qtmux.link(sink)
 
-    # Create and event loop and feed GStreamer bus messages to it
+    # create an event loop and feed gstreamer bus mesages to it
     loop = GLib.MainLoop()
     bus = pipeline.get_bus()
     bus.add_signal_watch()
     bus.connect("message", bus_call, loop)
 
-    # Start the pipeline
+    print("Starting pipeline \n")
+    # start play back and listed to events
     pipeline.set_state(Gst.State.PLAYING)
     try:
         loop.run()
-    except:
+    except Exception as e:
         pass
-
-    # Cleanup
+    # cleanup
+    print("Exiting app\n")
     pipeline.set_state(Gst.State.NULL)
 
 
