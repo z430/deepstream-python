@@ -16,7 +16,7 @@ def run_pipeline(video_uri: str):
     pipeline = Pipeline(
         video_uri=video_uri,
         pgie_config_path=os.path.join(CONFIGS_DIR, "pgies/yolov5.txt"),
-        tracker_config_path=os.path.join(CONFIGS_DIR, "trackers/DeepSORT.txt"),
+        tracker_config_path=os.path.join(CONFIGS_DIR, "trackers/nvdcf.txt"),
         output_format="mp4",
     )
     pipeline.run()
@@ -35,10 +35,10 @@ def run_segmentation_pipeline(video_uri: str):
 def run_anonymization_pipeline(video_uri: str):
     pipeline = AnonymizationPipeline(
         video_uri=video_uri,
-        pgie_config_path=os.path.join(CONFIGS_DIR, "pgies/yolov4.txt"),
+        pgie_config_path=os.path.join(CONFIGS_DIR, "pgies/yolov5.txt"),
         tracker_config_path=os.path.join(CONFIGS_DIR, "trackers/nvdcf.txt"),
         target_classes=[2],
-        enable_osd=False,
+        output_format="mp4",
     )
     pipeline.run()
 

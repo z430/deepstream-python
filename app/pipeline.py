@@ -1,14 +1,14 @@
 """This module contains all Gst pipeline related logic."""
 
+import configparser
+import logging
+import math
 import os
 import sys
-import math
-import logging
-import configparser
+from collections import defaultdict
 from functools import partial
 from inspect import signature
-from typing import List
-from collections import defaultdict
+from typing import List, Optional
 
 import cv2
 import numpy as np
@@ -18,14 +18,14 @@ import gi
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstRtspServer", "1.0")
-from gi.repository import GObject, Gst, GstRtspServer
 import pyds
+from gi.repository import GObject, Gst, GstRtspServer
 
-from app.utils.bus_call import bus_call
-from app.utils.is_aarch_64 import is_aarch64
-from app.utils.fps import FPSMonitor
+from app.config import CONFIGS_DIR, CROPS_DIR, OUTPUT_DIR
 from app.utils.bbox import rect_params_to_coords
-from app.config import CONFIGS_DIR, OUTPUT_DIR, CROPS_DIR
+from app.utils.bus_call import bus_call
+from app.utils.fps import FPSMonitor
+from app.utils.is_aarch_64 import is_aarch64
 
 PGIE_CLASS_ID_VEHICLE = 2
 PGIE_CLASS_ID_PERSON = 0
@@ -38,7 +38,7 @@ class Pipeline:
         self,
         *,
         video_uri: str,
-        output_video_path: str = None,
+        output_video_path: Optional[str] = None,
         pgie_config_path: str = os.path.join(CONFIGS_DIR, "pgies/pgie.txt"),
         tracker_config_path: str = os.path.join(CONFIGS_DIR, "trackers/nvdcf.txt"),
         enable_osd: bool = True,
@@ -69,6 +69,10 @@ class Pipeline:
             if output_video_path
             else os.path.join(OUTPUT_DIR, "out.mp4")
         )
+        print(self.output_video_path)
+        import sys
+
+        sys.exit()
         self.pgie_config_path = pgie_config_path
         self.tracker_config_path = tracker_config_path
         self.enable_osd = enable_osd
