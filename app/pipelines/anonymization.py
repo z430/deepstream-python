@@ -18,7 +18,7 @@ class AnonymizationPipeline(Pipeline):
         self.target_classes = target_classes
 
     @staticmethod
-    def _anonymize_bbox(image, obj_meta, mode="fill"):
+    def _anonymize_bbox(image, obj_meta, mode="blur"):
         rect_params = obj_meta.rect_params
         top = int(rect_params.top)
         left = int(rect_params.left)
@@ -61,7 +61,6 @@ class AnonymizationPipeline(Pipeline):
                 if self.target_classes and obj_meta.class_id not in self.target_classes:
                     continue
 
-                print(self.target_classes, obj_meta.class_id)
                 frame = self._anonymize_bbox(frame, obj_meta)
 
     def _add_probes(self):

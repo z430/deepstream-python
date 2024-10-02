@@ -37,7 +37,7 @@ def run_anonymization_pipeline(video_uri: str):
         video_uri=video_uri,
         pgie_config_path=os.path.join(CONFIGS_DIR, "pgies/yolov5.txt"),
         tracker_config_path=os.path.join(CONFIGS_DIR, "trackers/nvdcf.txt"),
-        target_classes=[2],
+        target_classes=[1],
         output_format="mp4",
     )
     pipeline.run()

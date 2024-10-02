@@ -9,6 +9,8 @@ from collections import defaultdict
 from functools import partial
 from inspect import signature
 from typing import List, Optional
+from datetime import datetime
+import pytz
 
 import cv2
 import numpy as np
@@ -27,8 +29,7 @@ from app.utils.bus_call import bus_call
 from app.utils.fps import FPSMonitor
 from app.utils.is_aarch_64 import is_aarch64
 
-PGIE_CLASS_ID_VEHICLE = 2
-PGIE_CLASS_ID_PERSON = 0
+
 TILED_OUTPUT_WIDTH = 1920
 TILED_OUTPUT_HEIGHT = 1080
 
@@ -69,10 +70,7 @@ class Pipeline:
             if output_video_path
             else os.path.join(OUTPUT_DIR, "out.mp4")
         )
-        print(self.output_video_path)
-        import sys
 
-        sys.exit()
         self.pgie_config_path = pgie_config_path
         self.tracker_config_path = tracker_config_path
         self.enable_osd = enable_osd
@@ -151,39 +149,48 @@ class Pipeline:
         return elm
 
     def _create_source_bin(self, index=0):
-        def _cb_newpad(_, decoder_src_pad, data):
-            self.logger.info("Decodebin pad added")
+        def _cb_newpad(decodebin, decoder_src_pad, data):
             caps = decoder_src_pad.get_current_caps()
-            gst_struct = caps.get_structure(0)
-            gst_name = gst_struct.get_name()
+            gststruct = caps.get_structure(0)
+            gstname = gststruct.get_name()
             source_bin = data
             features = caps.get_features(0)
 
-            # Need to check if the pad created by the decodebin is for video and not audio.
-            self.logger.debug(f"gstname={gst_name}")
-            if gst_name.find("video") != -1:
-                # Link the decodebin pad only if decodebin has picked nvidia decoder plugin nvdec_*.
-                # We do this by checking if the pad caps contain NVMM memory features.
-                self.logger.debug(f"features={features}")
+            # Need to check if the pad created by the decodebin is for video and not
+            # audio.
+            print("gstname=", gstname)
+            if gstname.find("video") != -1:
+                # Link the decodebin pad only if decodebin has picked nvidia
+                # decoder plugin nvdec_*. We do this by checking if the pad caps contain
+                # NVMM memory features.
+                print("features=", features)
                 if features.contains("memory:NVMM"):
                     # Get the source bin ghost pad
                     bin_ghost_pad = source_bin.get_static_pad("src")
                     if not bin_ghost_pad.set_target(decoder_src_pad):
-                        self.logger.error(
-                            "Failed to link decoder src pad to source bin ghost pad"
+                        sys.stderr.write(
+                            "Failed to link decoder src pad to source bin ghost pad\n"
                         )
                 else:
-                    self.logger.error("Decodebin did not pick nvidia decoder plugin.")
+                    sys.stderr.write(
+                        " Error: Decodebin did not pick nvidia decoder plugin.\n"
+                    )
 
-        def _decodebin_child_added(_, obj, name, user_data):
-            self.logger.info(f"Decodebin child added: {name}")
+        def _decodebin_child_added(child_proxy, obj, name, user_data):
+            print("Decodebin child added:", name, "\n")
             if name.find("decodebin") != -1:
                 obj.connect("child-added", _decodebin_child_added, user_data)
+
+            if "source" in name:
+                source_element = child_proxy.get_by_name("source")
+                if source_element.find_property("drop-on-latency") != None:
+                    obj.set_property("drop-on-latency", True)
 
         self.logger.info("Creating Source bin")
 
         # Create a source GstBin to abstract this bin's content from the rest of the pipeline
         bin_name = "source-bin-%02d" % index
+        print(bin_name)
         nbin = Gst.Bin.new(bin_name)
         if not nbin:
             self.logger.error("Unable to create source bin")
@@ -218,6 +225,7 @@ class Pipeline:
         streammux.set_property("height", self.input_height)
         streammux.set_property("batch-size", 1)
         streammux.set_property("batched-push-timeout", 4000000)
+        streammux.set_property("live-source", 1)
 
         return streammux
 
@@ -274,7 +282,7 @@ class Pipeline:
             "capsfilter", "capsfilter2", "Caps filter 2", add=False
         )
         capsfilter2.set_property(
-            "caps", Gst.Caps.from_string("video/x-raw, format=I420")
+            "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
         )
 
         # On Jetson, there is a problem with the encoder failing to initialize due to limitation on
@@ -289,11 +297,12 @@ class Pipeline:
         encoder = self._create_element(
             "nvv4l2h264enc", "encoder", "Encoder", detail=preload_reminder, add=False
         )
-        encoder.set_property("bitrate", 33000000)
+        encoder.set_property("bitrate", 4000000)
 
         codeparser = self._create_element(
-            "mpeg4videoparse", "mpeg4-parser", "Parser", add=False
+            "h264parse", "h264-parser", "Parser", add=False
         )
+
         container = self._create_element("qtmux", "qtmux", "Container", add=False)
 
         filesink = self._create_element("filesink", "filesink", "Sink", add=False)
@@ -400,6 +409,8 @@ class Pipeline:
 
         if self.enable_osd:
             self.nvosd = self._create_element("nvdsosd", "onscreendisplay", "OSD")
+            self.nvosd.set_property("display-bbox", False)
+            self.nvosd.set_property("display-text", True)
 
         self.queue1 = self._create_element("queue", "queue1", "Queue 1")
 
@@ -436,35 +447,41 @@ class Pipeline:
     def _write_osd_analytics(
         self, batch_meta, l_frame_meta: List, ll_obj_meta: List[List]
     ):
-        obj_counter = defaultdict(int)
-
         for frame_meta, l_obj_meta in zip(l_frame_meta, ll_obj_meta):
-            frame_number = frame_meta.frame_num
-            num_rects = frame_meta.num_obj_meta
-
             for obj_meta in l_obj_meta:
-                obj_counter[obj_meta.class_id] += 1
-                obj_meta.rect_params.border_color.set(0.0, 0.0, 1.0, 0.0)
+                obj_meta.text_params.display_text = ""
 
             display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
             display_meta.num_labels = 1
             py_nvosd_text_params = display_meta.text_params[0]
-            py_nvosd_text_params.display_text = "Frame Number={} Number of Objects={} Vehicle_count={} Person_count={}".format(
-                frame_number,
-                num_rects,
-                obj_counter[PGIE_CLASS_ID_VEHICLE],
-                obj_counter[PGIE_CLASS_ID_PERSON],
-            )
+            timezone = pytz.timezone("Asia/Tokyo")
+            current_time = datetime.now(timezone).strftime("%Y-%m-%d %H:%M:%S")
 
-            py_nvosd_text_params.x_offset = 10
-            py_nvosd_text_params.y_offset = 12
+            # Configure text parameters
+            py_nvosd_text_params = display_meta.text_params[0]
+            py_nvosd_text_params.display_text = current_time
+
+            # Position the text at the bottom-left corner
+            py_nvosd_text_params.x_offset = (
+                frame_meta.source_frame_width - 330
+            )  # Adjust as needed
+            py_nvosd_text_params.y_offset = (
+                frame_meta.source_frame_height - 50
+            )  # Adjust as needed
+            # Set font parameters
             py_nvosd_text_params.font_params.font_name = "Serif"
-            py_nvosd_text_params.font_params.font_size = 10
-            py_nvosd_text_params.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
-            py_nvosd_text_params.set_bg_clr = 1
-            py_nvosd_text_params.text_bg_clr.set(0.0, 0.0, 0.0, 1.0)
+            py_nvosd_text_params.font_params.font_size = 20
+            py_nvosd_text_params.font_params.font_color.set(
+                1.0, 1.0, 1.0, 1.0
+            )  # White color
 
-            self.logger.info(pyds.get_string(py_nvosd_text_params.display_text))
+            # Set text background color
+            py_nvosd_text_params.set_bg_clr = 1
+            py_nvosd_text_params.text_bg_clr.set(
+                0.0, 0.0, 0.0, 0.5
+            )  # Semi-transparent black
+
+            # Add display meta to frame meta
             pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
 
             self.fps_streams["stream{0}".format(frame_meta.pad_index)].get_fps()
@@ -575,7 +592,7 @@ class Pipeline:
         return pad
 
     def _add_probes(self):
-        tiler_sinkpad = self._get_static_pad(self.tiler)
+        tiler_sinkpad = self._get_static_pad(self.tiler, pad_name="sink")
 
         if self.enable_osd and self.write_osd_analytics:
             tiler_sinkpad.add_probe(

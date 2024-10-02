@@ -4,11 +4,92 @@ from libs.platform import PlatformInfo
 from loguru import logger
 import math
 import pyds
+import time
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GObject, GLib
 
 platform_info = PlatformInfo()
+
+frame_count = {}
+fps_streams = {}
+last_update_time = {}
+
+
+def tiler_src_pad_buffer_probe(pad, info, u_data):
+    global frame_count, fps_streams, last_update_time
+
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        logger.error("Unable to get GstBuffer")
+        return Gst.PadProbeReturn.OK
+
+    # Retrieve batch metadata from the GstBuffer
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+
+    l_frame = batch_meta.frame_meta_list
+
+    while l_frame:
+        try:
+            # Get frame metadata
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        except StopIteration:
+            break
+
+        stream_id = frame_meta.pad_index  # Unique stream identifier
+        frame_number = frame_meta.frame_num
+
+        # Initialize counters if necessary
+        if stream_id not in frame_count:
+            frame_count[stream_id] = 0
+            fps_streams[stream_id] = 0.0
+            last_update_time[stream_id] = time.time()
+
+        frame_count[stream_id] += 1
+        current_time = time.time()
+        time_diff = current_time - last_update_time[stream_id]
+
+        if time_diff >= 1.0:
+            fps = frame_count[stream_id] / time_diff
+            fps_streams[stream_id] = fps
+            frame_count[stream_id] = 0
+            last_update_time[stream_id] = current_time
+            logger.info(f"Stream {stream_id} FPS: {fps}")
+
+        # Create display meta to overlay FPS
+        display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+        display_meta.num_labels = 1
+        py_nvosd_text_params = display_meta.text_params[0]
+
+        # Set display text
+        py_nvosd_text_params.display_text = (
+            f"Stream {stream_id} FPS: {fps_streams[stream_id]:.2f}"
+        )
+
+        # Text position
+        py_nvosd_text_params.x_offset = 10
+        py_nvosd_text_params.y_offset = 12
+
+        # Set text parameters
+        py_nvosd_text_params.font_params.font_name = "Serif"
+        py_nvosd_text_params.font_params.font_size = 20
+        py_nvosd_text_params.font_params.font_color.set(
+            1.0, 1.0, 1.0, 1.0
+        )  # White color
+
+        # Set text background color
+        py_nvosd_text_params.set_bg_clr = 1
+        py_nvosd_text_params.text_bg_clr.set(0.0, 0.0, 0.0, 1.0)  # Black background
+
+        # Add display meta to frame meta
+        pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+
+        try:
+            l_frame = l_frame.next
+        except StopIteration:
+            break
+
+    return Gst.PadProbeReturn.OK
 
 
 def bus_call(bus, message, loop):
@@ -199,9 +280,6 @@ def main(args):
     caps.set_property(
         "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12")
     )
-    # caps.set_property(
-    #     "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
-    # )
 
     # make the encoder
     encoder = Gst.ElementFactory.make("nvv4l2h264enc", "encoder")
@@ -271,6 +349,13 @@ def main(args):
     pipeline.add(h264parse)
     pipeline.add(qtmux)
     pipeline.add(sink)
+
+    # Attach probe to tiler's src pad
+    tiler_src_pad = tiler.get_static_pad("src")
+    if not tiler_src_pad:
+        logger.error("Unable to get src pad of tiler")
+    else:
+        tiler_src_pad.add_probe(Gst.PadProbeType.BUFFER, tiler_src_pad_buffer_probe, 0)
 
     print("Linking elements in the Pipeline \n")
     streammux.link(pgie)

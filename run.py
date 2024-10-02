@@ -1,7 +1,6 @@
 from argparse import ArgumentParser
 
-from app.core import run_pipeline
-from app.core import run_anonymization_pipeline
+from app.core import run_pipeline, run_anonymization_pipeline
 
 
 if __name__ == "__main__":

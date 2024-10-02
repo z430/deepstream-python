@@ -26,3 +26,10 @@ RUN git clone https://github.com/marcoslucianops/DeepStream-Yolo.git \
     && cd DeepStream-Yolo \
     && make -C nvdsinfer_custom_impl_Yolo clean && make -C nvdsinfer_custom_impl_Yolo
 
+RUN pip3 install opencv-python pytz
+RUN mkdir /home/cogai/ \
+    && cd /home/cogai \
+    && git clone -b 1.16.2 https://github.com/GStreamer/gst-rtsp-server.git  \
+    && apt-get install libgstrtspserver-1.0 libgstreamer1.0-dev \
+    && cd gst-rtsp-server/examples \
+    && gcc test-launch.c -o test-launch $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-rtsp-server-1.0)
