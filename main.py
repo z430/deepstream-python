@@ -1,88 +1,89 @@
 import sys
+
 import gi
-from libs.platform import PlatformInfo
-from loguru import logger
-import math
-import pyds
-import time
+import argparse
+import signal
+from ctypes import *
 
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst, GObject, GLib
+from gi.repository import Gst
+from gi.repository import GLib
 
+import pyds
+
+MUXER_OUTPUT_WIDTH = 540
+MUXER_OUTPUT_HEIGHT = 540  # 1080
+MUXER_BATCH_TIMEOUT_USEC = 33000
+from libs.platform import PlatformInfo
+import platform
+
+import cv2
+from datetime import datetime
+import pytz
+
+target_classes = [1]
+PGIE_CLASS_ID_PERSON = 0
+PGIE_CLASS_ID_HEAD = 1
+
+pgie_classes_str = ["Person", "Head"]
 platform_info = PlatformInfo()
 
-frame_count = {}
-fps_streams = {}
-last_update_time = {}
+
+def is_aarch64():
+    return platform.uname()[4] == "aarch64"
 
 
-def tiler_src_pad_buffer_probe(pad, info, u_data):
-    global frame_count, fps_streams, last_update_time
-
+def tiler_sink_pad_buffer_probe(pad, info, u_data):
+    frame_number = 0
+    num_rects = 0
     gst_buffer = info.get_buffer()
     if not gst_buffer:
-        logger.error("Unable to get GstBuffer")
+        print("Unable to get GstBuffer")
         return Gst.PadProbeReturn.OK
 
-    # Retrieve batch metadata from the GstBuffer
+    # Retrieve batch metadata from the gst_buffer
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
 
     l_frame = batch_meta.frame_meta_list
-
-    while l_frame:
+    while l_frame is not None:
         try:
-            # Get frame metadata
             frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
         except StopIteration:
             break
 
-        stream_id = frame_meta.pad_index  # Unique stream identifier
         frame_number = frame_meta.frame_num
+        l_obj = frame_meta.obj_meta_list
+        num_rects = frame_meta.num_obj_meta
 
-        # Initialize counters if necessary
-        if stream_id not in frame_count:
-            frame_count[stream_id] = 0
-            fps_streams[stream_id] = 0.0
-            last_update_time[stream_id] = time.time()
+        while l_obj is not None:
+            try:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+            except StopIteration:
+                break
 
-        frame_count[stream_id] += 1
-        current_time = time.time()
-        time_diff = current_time - last_update_time[stream_id]
+            n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
 
-        if time_diff >= 1.0:
-            fps = frame_count[stream_id] / time_diff
-            fps_streams[stream_id] = fps
-            frame_count[stream_id] = 0
-            last_update_time[stream_id] = current_time
-            logger.info(f"Stream {stream_id} FPS: {fps}")
+            rect_params = obj_meta.rect_params
+            top = int(rect_params.top)
+            left = int(rect_params.left)
+            width = int(rect_params.width)
+            height = int(rect_params.height)
 
-        # Create display meta to overlay FPS
-        display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-        display_meta.num_labels = 1
-        py_nvosd_text_params = display_meta.text_params[0]
+            x1 = left
+            y1 = top
+            x2 = left + width
+            y2 = top + height
 
-        # Set display text
-        py_nvosd_text_params.display_text = (
-            f"Stream {stream_id} FPS: {fps_streams[stream_id]:.2f}"
-        )
+            if obj_meta.class_id in target_classes:
+                bbox = n_frame[y1:y2, x1:x2]
+                n_frame[y1:y2, x1:x2] = cv2.GaussianBlur(bbox, (15, 15), 60)
 
-        # Text position
-        py_nvosd_text_params.x_offset = 10
-        py_nvosd_text_params.y_offset = 12
+            try:
+                l_obj = l_obj.next
+            except StopIteration:
+                break
 
-        # Set text parameters
-        py_nvosd_text_params.font_params.font_name = "Serif"
-        py_nvosd_text_params.font_params.font_size = 20
-        py_nvosd_text_params.font_params.font_color.set(
-            1.0, 1.0, 1.0, 1.0
-        )  # White color
-
-        # Set text background color
-        py_nvosd_text_params.set_bg_clr = 1
-        py_nvosd_text_params.text_bg_clr.set(0.0, 0.0, 0.0, 1.0)  # Black background
-
-        # Add display meta to frame meta
-        pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
+        print(f"Frame Number={frame_number} Number of Objects={num_rects}")
 
         try:
             l_frame = l_frame.next
@@ -95,281 +96,333 @@ def tiler_src_pad_buffer_probe(pad, info, u_data):
 def bus_call(bus, message, loop):
     t = message.type
     if t == Gst.MessageType.EOS:
-        print("End-of-stream")
+        sys.stdout.write("End-of-stream\n")
         loop.quit()
+    elif t == Gst.MessageType.WARNING:
+        err, debug = message.parse_warning()
+        sys.stderr.write("Warning: %s: %s\n" % (err, debug))
     elif t == Gst.MessageType.ERROR:
         err, debug = message.parse_error()
-        print("Error: {}, {}".format(err, debug))
+        sys.stderr.write("Error: %s: %s\n" % (err, debug))
         loop.quit()
     return True
 
 
-def on_rtsp_pad_added(src, pad, depay):
-    sink_pad = depay.get_static_pad("sink")
-    if not sink_pad.is_linked():
-        pad.link(sink_pad)
-
-
-def on_demux_pad_added(src, pad, h264parser):
-    sink_pad = h264parser.get_static_pad("sink")
-    if not sink_pad.is_linked():
-        pad.link(sink_pad)
-
-
 def cb_newpad(decodebin, decoder_src_pad, data):
-    logger.info("In cb_newpad")
+    """
+    The function is called when a new pad is created by the decodebin.
+    The function checks if the new pad is for video and not audio.
+    If the new pad is for video, the function checks if the pad caps contain NVMM memory features.
+    If the pad caps contain NVMM memory features, the function links the decodebin pad to the source bin
+    ghost pad.
+    If the pad caps do not contain NVMM memory features, the function prints an error message.
+    :param decodebin: The decodebin element that is creating the new pad
+    :param decoder_src_pad: The source pad created by the decodebin element
+    :param data: This is the data that was passed to the callback function. In this case, it is the
+    source_bin
+    """
+    print("In cb_newpad\n")
     caps = decoder_src_pad.get_current_caps()
     gststruct = caps.get_structure(0)
     gstname = gststruct.get_name()
     source_bin = data
     features = caps.get_features(0)
 
-    # need to check if the pad created by the decodebin is for video and not audio
+    # Need to check if the pad created by the decodebin is for video and not
+    # audio.
+    print("gstname=", gstname)
     if gstname.find("video") != -1:
-        # link the decodebin pad only if decodebin has picked nvidia decoder plugin
-        # nvdec_*. we do this by checking if the pad caps contain NVMM memory features
+        # Link the decodebin pad only if decodebin has picked nvidia
+        # decoder plugin nvdec_*. We do this by checking if the pad caps contain
+        # NVMM memory features.
+        print("features=", features)
         if features.contains("memory:NVMM"):
             # Get the source bin ghost pad
             bin_ghost_pad = source_bin.get_static_pad("src")
             if not bin_ghost_pad.set_target(decoder_src_pad):
-                logger.error("Failed to link decoder src pad to source bin ghost pad")
+                sys.stderr.write(
+                    "Failed to link decoder src pad to source bin ghost pad\n"
+                )
         else:
-            logger.error("Error: Decodebin did not pick nvidia decoder plugin.")
+            sys.stderr.write(" Error: Decodebin did not pick nvidia decoder plugin.\n")
 
 
-def decodebin_child_added(child_proxy, obj, name, user_data):
-    logger.info("Decodebin child added: {0}".format(name))
+def decodebin_child_added(child_proxy, Object, name, user_data):
+    """
+    If the child added to the decodebin is another decodebin, connect to its child-added signal. If the
+    child added is a source, set its drop-on-latency property to True.
+
+    :param child_proxy: The child element that was added to the decodebin
+    :param Object: The object that emitted the signal
+    :param name: The name of the element that was added
+    :param user_data: This is a pointer to the data that you want to pass to the callback function
+    """
+    print("Decodebin child added:", name, "\n")
     if name.find("decodebin") != -1:
-        obj.connect("child-added", decodebin_child_added, user_data)
-
-    if not platform_info.is_integrated_gpu() and name.find("nvv4l2decoder") != -1:
-        # Use CUDA unified memory in the pipeline so frames can be easily accessed on CPU in Python.
-        # 0: NVBUF_MEM_CUDA_DEVICE, 1: NVBUF_MEM_CUDA_PINNED, 2: NVBUF_MEM_CUDA_UNIFIED
-        # Dont use direct macro here like NVBUF_MEM_CUDA_UNIFIED since nvv4l2decoder uses a
-        # different enum internally
-        obj.set_property("cudadec-memtype", 2)
+        Object.connect("child-added", decodebin_child_added, user_data)
 
     if "source" in name:
         source_element = child_proxy.get_by_name("source")
         if source_element.find_property("drop-on-latency") != None:
-            obj.set_property("drop-on-latency", True)
+            Object.set_property("drop-on-latency", True)
 
 
 def create_source_bin(index, uri):
-    logger.info("Creating source bin")
-    # create a source GstBin to abstract this bin's content from the rest of the pipeline
-    bin_name = f"source-bin-{index}"
-    logger.info(f"Creating source bin {bin_name}")
+    """
+    It creates a GstBin, adds a uridecodebin to it, and connects the uridecodebin's pad-added signal to
+    a callback function
+
+    :param index: The index of the source bin
+    :param uri: The URI of the video file to be played
+    :return: A bin with a uri decode bin and a ghost pad.
+    """
+    print("Creating source bin")
+
+    # Create a source GstBin to abstract this bin's content from the rest of the
+    # pipeline
+    bin_name = "source-bin-%02d" % index
+    print(bin_name)
     nbin = Gst.Bin.new(bin_name)
     if not nbin:
-        logger.error("Failed to create source bin")
-        return None
+        sys.stderr.write(" Unable to create source bin \n")
 
-    # Source element for reading from the uri
-    # We will use decodebin and let it figure out the container format
-    # stream and the codec and plug the appropriate demux and decode plugins
+    # Source element for reading from the uri.
+    # We will use decodebin and let it figure out the container format of the
+    # stream and the codec and plug the appropriate demux and decode plugins.
     uri_decode_bin = Gst.ElementFactory.make("uridecodebin", "uri-decode-bin")
     if not uri_decode_bin:
-        logger.error("Failed to create uri decode bin")
-        return None
-
+        sys.stderr.write(" Unable to create uri decode bin \n")
     # We set the input uri to the source element
     uri_decode_bin.set_property("uri", uri)
-    # connect to the "pad-added" signal of the decodebin which generates a
-    # callback once a new pad for raw data has been created by the decodebin
+    # Connect to the "pad-added" signal of the decodebin which generates a
+    # callback once a new pad for raw data has beed created by the decodebin
     uri_decode_bin.connect("pad-added", cb_newpad, nbin)
     uri_decode_bin.connect("child-added", decodebin_child_added, nbin)
 
-    # we need to create a ghost pad for the source bin which will act as a proxy
-    # for the video decoder src pad. The ghost pad will not have a target right now.
-    # Once the decode bin creates the video decoder and provides the src pad, we will
-    # set the ghost pad target to the video decoder src pad.
-
+    # We need to create a ghost pad for the source bin which will act as a proxy
+    # for the video decoder src pad. The ghost pad will not have a target right
+    # now. Once the decode bin creates the video decoder and generates the
+    # cb_newpad callback, we will set the ghost pad target to the video decoder
+    # src pad.
     Gst.Bin.add(nbin, uri_decode_bin)
     bin_pad = nbin.add_pad(Gst.GhostPad.new_no_target("src", Gst.PadDirection.SRC))
     if not bin_pad:
-        logger.error("Failed to add ghost pad in source bin")
+        sys.stderr.write(" Failed to add ghost pad in source bin \n")
         return None
     return nbin
 
 
-def main(args):
-    # Check input arguments
-    if len(args) < 2:
-        sys.stderr.write(
-            "usage: %s <uri1> [uri2] ... [uriN] <folder to save frames>\n" % args[0]
-        )
-        sys.exit(1)
+def make_element(element_name, i):
+    """
+    Creates a Gstreamer element with unique name
+    Unique name is created by adding element type and index e.g. `element_name-i`
+    Unique name is essential for all the element in pipeline otherwise gstreamer will throw exception.
+    :param element_name: The name of the element to create
+    :param i: the index of the element in the pipeline
+    :return: A Gst.Element object
+    """
+    element = Gst.ElementFactory.make(element_name, element_name)
+    if not element:
+        sys.stderr.write(" Unable to create {0}".format(element_name))
+    element.set_property("name", "{0}-{1}".format(element_name, str(i)))
+    return element
 
-    number_sources = len(args) - 1
-    logger.info(f"Number of sources: {number_sources}")
-    # Standard GStreamer initialization
+
+def signal_handler(sig, frame, pipeline, loop):
+    print("Interrupt received, sending EOS...")
+    pipeline.send_event(Gst.Event.new_eos())  # Send EOS to the pipeline
+    GLib.timeout_add(
+        5000, lambda: loop.quit()
+    )  # Quit the loop after waiting a bit for EOS
+
+
+def create_splitmuxsink(camera_number, split_duration_seconds):
+    # Create the splitmuxsink element for handling file rotation
+    splitmuxsink = Gst.ElementFactory.make(
+        "splitmuxsink", f"splitmuxsink_camera_{camera_number}"
+    )
+
+    if not splitmuxsink:
+        sys.stderr.write(f"Unable to create splitmuxsink for camera {camera_number}\n")
+        return None
+
+    # Set the location format for the file names (camera number + timestamp)
+    # Example: camera-1-YYYYMMDDTHHMMSS.mp4
+    location_pattern = f"outputs/camera-{camera_number}-%Y%m%dT%H%M%S.mp4"
+    splitmuxsink.set_property("location", location_pattern)
+
+    # Set the duration for each segment in nanoseconds (1 second = 1,000,000,000 nanoseconds)
+    split_duration_nanoseconds = split_duration_seconds * Gst.SECOND
+    splitmuxsink.set_property("max-size-time", split_duration_nanoseconds)
+
+    # Set the file format to MP4
+    splitmuxsink.set_property("muxer", Gst.ElementFactory.make("mp4mux", None))
+
+    return splitmuxsink
+
+
+def main(args):
+    input_sources = args
+    number_sources = len(input_sources)
+
     Gst.init(None)
 
-    # Create the pipeline
+    # Create gstreamer elements */
+    # Create Pipeline element that will form a connection of other elements
+    print("Creating Pipeline \n ")
     pipeline = Gst.Pipeline()
     is_live = False
-    logger.info("Creating Pipeline")
 
     if not pipeline:
-        sys.stderr.write("Unable to create Pipeline\n")
-        sys.exit(1)
+        sys.stderr.write(" Unable to create Pipeline \n")
+    print("Creating streamux \n ")
 
     # Create nvstreammux instance to form batches from one or more sources.
-    streammux = Gst.ElementFactory.make("nvstreammux", "stream-muxer")
+    streammux = Gst.ElementFactory.make("nvstreammux", "Stream-muxer")
     if not streammux:
-        sys.stderr.write("Unable to create NvStreamMux \n")
-    pipeline.add(streammux)
+        sys.stderr.write(" Unable to create NvStreamMux \n")
 
+    pipeline.add(streammux)
     for i in range(number_sources):
-        logger.info("Creating source bin")
-        uri_name = args[i + 1]
+        print("Creating source_bin ", i, " \n ")
+        uri_name = input_sources[i]
         if uri_name.find("rtsp://") == 0:
             is_live = True
-        else:
-            is_live = False
         source_bin = create_source_bin(i, uri_name)
         if not source_bin:
-            logger.error(f"Failed to create source bin for {uri_name}")
+            sys.stderr.write("Unable to create source bin \n")
         pipeline.add(source_bin)
-        pad_name = f"sink_{i}"
-        sinkpad = streammux.request_pad_simple(pad_name)
+        padname = "sink_%u" % i
+        sinkpad = streammux.request_pad_simple(padname)
         if not sinkpad:
-            logger.error(f"Unable to create sink pad bin {i}")
+            sys.stderr.write("Unable to create sink pad bin \n")
         srcpad = source_bin.get_static_pad("src")
         if not srcpad:
-            logger.error(f"Unable to create src pad bin {i}")
+            sys.stderr.write("Unable to create src pad bin \n")
         srcpad.link(sinkpad)
 
-    logger.info("Creating PGIE")
+    queue1 = Gst.ElementFactory.make("queue", "queue1")
+    pipeline.add(queue1)
+
+    print("Creating Pgie \n ")
     pgie = Gst.ElementFactory.make("nvinfer", "primary-inference")
     if not pgie:
         sys.stderr.write(" Unable to create pgie \n")
 
-    # add nvvidconv1 and filter1 to convert frames to RGBA
-    # which is easier to work with in Python.
-    logger.info("Creating nvvidconv1")
-    nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")
-    if not nvvidconv1:
-        sys.stderr.write(" Unable to create nvvidconv1 \n")
-
-    logger.info("Creating filter1")
-    caps1 = Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
-    filter1 = Gst.ElementFactory.make("capsfilter", "filter1")
-    if not filter1:
-        sys.stderr.write(" Unable to create filter1 \n")
-    filter1.set_property("caps", caps1)
-    logger.info("creating tiler")
-
-    logger.info("Creating nvvidconv")
-    nvvidconv = Gst.ElementFactory.make("nvvideoconvert", "convertor")
-    if not nvvidconv:
-        sys.stderr.write(" Unable to create nvvidconv \n")
-
-    logger.info("Creating nvosd")
-    nvosd = Gst.ElementFactory.make("nvdsosd", "onscreendisplay")
-    if not nvosd:
-        sys.stderr.write(" Unable to create nvosd \n")
-
-    nvvidconv_postosd = Gst.ElementFactory.make("nvvideoconvert", "convertor_postosd")
-    if not nvvidconv_postosd:
-        sys.stderr.write(" Unable to create nvvidconv_postosd \n")
-
-    # create caps filter
-    caps = Gst.ElementFactory.make("capsfilter", "filter")
-    caps.set_property(
-        "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12")
+    nvvidconv = make_element("nvvideoconvert", 1)
+    capsfilter = make_element("capsfilter", 1)
+    capsfilter.set_property(
+        "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA")
     )
 
-    # make the encoder
-    encoder = Gst.ElementFactory.make("nvv4l2h264enc", "encoder")
-    encoder.set_property("bitrate", 4000000)
-    if platform_info.is_integrated_gpu():
-        encoder.set_property("preset-level", 1)
-        encoder.set_property("insert-sps-pps", 1)
+    nvdemux = Gst.ElementFactory.make("nvstreamdemux", "nvdemux")
+    if not nvdemux:
+        sys.stderr.write(" Unable to create nvstreamdemux \n")
+    pipeline.add(nvdemux)
+
+    if is_live:
+        print("Atleast one of the sources is live")
+        streammux.set_property("live-source", 1)
 
     streammux.set_property("width", 1920)
     streammux.set_property("height", 1080)
     streammux.set_property("batch-size", number_sources)
-    streammux.set_property("batched-push-timeout", 4000000)
-
-    pgie.set_property("config-file-path", "yolov5.txt")
+    streammux.set_property("batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC)
+    pgie.set_property("config-file-path", "configs/pgies/yolov5.txt")
     pgie_batch_size = pgie.get_property("batch-size")
     if pgie_batch_size != number_sources:
-        logger.error(
-            f"WARNING: Overriding infer-config batch-size ({pgie_batch_size}) with number of sources ({number_sources})"
+        print(
+            "WARNING: Overriding infer-config batch-size",
+            pgie_batch_size,
+            " with number of sources ",
+            number_sources,
+            " \n",
         )
         pgie.set_property("batch-size", number_sources)
 
-    tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
-    if not tiler:
-        sys.stderr.write(" Unable to create tiler \n")
-
-    tiler_rows = max(1, int(math.sqrt(number_sources)))
-    tiler_columns = max(1, int(math.ceil((1.0 * number_sources) / tiler_rows)))
-
-    tiler.set_property("rows", tiler_rows)
-    tiler.set_property("columns", tiler_columns)
-    tiler.set_property("width", 1920)
-    tiler.set_property("height", 1080)
-
-    sink = Gst.ElementFactory.make("filesink", "file-sink")
-    sink.set_property("location", "output.mp4")
-    sink.set_property("sync", False)
-    sink.set_property("async", False)
-
-    if not platform_info.is_integrated_gpu():
-        # Use CUDA unified memory in the pipeline so frames
-        # can be easily accessed on CPU in Python.
-        mem_type = int(pyds.NVBUF_MEM_CUDA_UNIFIED)
-        streammux.set_property("nvbuf-memory-type", mem_type)
-        nvvidconv.set_property("nvbuf-memory-type", mem_type)
-        nvvidconv1.set_property("nvbuf-memory-type", mem_type)
-        tiler.set_property("nvbuf-memory-type", mem_type)
-        nvvidconv_postosd.set_property("nvbuf-memory-type", mem_type)
-
-    h264parse = Gst.ElementFactory.make("h264parse", "h264-parser")
-    if not h264parse:
-        sys.stderr.write(" Unable to create h264parse \n")
-
-    qtmux = Gst.ElementFactory.make("qtmux", "qtmux")
-    if not qtmux:
-        sys.stderr.write(" Unable to create qtmux \n")
-
     print("Adding elements to Pipeline \n")
     pipeline.add(pgie)
-    pipeline.add(tiler)
     pipeline.add(nvvidconv)
-    pipeline.add(filter1)
-    pipeline.add(nvvidconv1)
-    pipeline.add(nvosd)
-    pipeline.add(nvvidconv_postosd)
-    pipeline.add(caps)
-    pipeline.add(encoder)
-    pipeline.add(h264parse)
-    pipeline.add(qtmux)
-    pipeline.add(sink)
+    pipeline.add(capsfilter)
 
-    # Attach probe to tiler's src pad
-    tiler_src_pad = tiler.get_static_pad("src")
-    if not tiler_src_pad:
-        logger.error("Unable to get src pad of tiler")
-    else:
-        tiler_src_pad.add_probe(Gst.PadProbeType.BUFFER, tiler_src_pad_buffer_probe, 0)
+    # linking
+    streammux.link(queue1)
+    queue1.link(pgie)
+    pgie.link(nvvidconv)
+    nvvidconv.link(capsfilter)
+    capsfilter.link(nvdemux)
 
-    print("Linking elements in the Pipeline \n")
-    streammux.link(pgie)
-    pgie.link(nvvidconv1)
-    nvvidconv1.link(filter1)
-    filter1.link(tiler)
-    tiler.link(nvvidconv)
-    nvvidconv.link(nvosd)
-    nvosd.link(nvvidconv_postosd)
-    nvvidconv_postosd.link(caps)
-    caps.link(encoder)
-    encoder.link(h264parse)
-    h264parse.link(qtmux)
-    qtmux.link(sink)
+    for i in range(number_sources):
+        # Create queue
+        queue = Gst.ElementFactory.make("queue", f"queue_{i}")
+        pipeline.add(queue)
+
+        # Create nvvideoconvert
+        videoconvert = Gst.ElementFactory.make("nvvideoconvert", f"videoconvert_{i}")
+        pipeline.add(videoconvert)
+
+        filter = Gst.ElementFactory.make("capsfilter", f"capsfilter_{i}")
+        filter.set_property(
+            "caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420")
+        )
+        pipeline.add(filter)
+
+        # Create encoder
+        encoder = Gst.ElementFactory.make("nvv4l2h264enc", f"encoder_{i}")
+        encoder.set_property("bitrate", 4000000)
+        pipeline.add(encoder)
+
+        codeparser = Gst.ElementFactory.make(
+            "h264parse",
+            f"h264-parser_{i}",
+        )
+        pipeline.add(codeparser)
+
+        # Create muxer
+        muxer = Gst.ElementFactory.make("qtmux", f"muxer_{i}")
+        pipeline.add(muxer)
+
+        # Create filesink
+        sink = Gst.ElementFactory.make("filesink", f"sink_{i}")
+        timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        sink.set_property("location", f"outputs/camera_{i}-{timestamp}.mp4")
+        sink.set_property("sync", 0)
+        sink.set_property("async", 0)
+        pipeline.add(sink)
+        # sink = create_splitmuxsink(i, 60)
+        # sink = Gst.ElementFactory.make("splitmuxsink", f"sink_{i}")
+        # print(sink)
+        # pipeline.add(sink)
+
+        # Link the elements
+        queue.link(videoconvert)
+        videoconvert.link(filter)
+        filter.link(encoder)
+        encoder.link(codeparser)
+        codeparser.link(muxer)
+        muxer.link(sink)
+
+        tiler_sink_pad = queue.get_static_pad("src")
+        if not tiler_sink_pad:
+            sys.stderr.write(" Unable to get src pad \n")
+        else:
+            tiler_sink_pad.add_probe(
+                Gst.PadProbeType.BUFFER, tiler_sink_pad_buffer_probe, 0
+            )
+
+        # Link nvstreamdemux to queue
+        src_pad = nvdemux.request_pad_simple(f"src_{i}")
+        if not src_pad:
+            sys.stderr.write(f"Unable to get src pad for stream {i}\n")
+        sink_pad = queue.get_static_pad("sink")
+        if not sink_pad:
+            sys.stderr.write(f"Unable to get sink pad for queue_{i}\n")
+        src_pad.link(sink_pad)
+
+    if not is_aarch64():
+        # Use CUDA unified memory so frames can be easily accessed on CPU in Python.
+        mem_type = int(pyds.NVBUF_MEM_CUDA_UNIFIED)
+        nvvidconv.set_property("nvbuf-memory-type", mem_type)
 
     # create an event loop and feed gstreamer bus mesages to it
     loop = GLib.MainLoop()
@@ -377,17 +430,51 @@ def main(args):
     bus.add_signal_watch()
     bus.connect("message", bus_call, loop)
 
+    # List the sources
+    print("Now playing...")
+    for i, source in enumerate(input_sources):
+        print(i, ": ", source)
+
     print("Starting pipeline \n")
     # start play back and listed to events
+    open("pipeline.dot", "w").write(
+        Gst.debug_bin_to_dot_data(pipeline, Gst.DebugGraphDetails.ALL)
+    )
     pipeline.set_state(Gst.State.PLAYING)
+    signal.signal(
+        signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, pipeline, loop)
+    )
+
     try:
         loop.run()
-    except Exception as e:
+    except:
         pass
     # cleanup
     print("Exiting app\n")
     pipeline.set_state(Gst.State.NULL)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="deepstream_demux_multi_in_multi_out.py",
+        description="deepstream-demux-multi-in-multi-out takes multiple URI streams as input"
+        "and uses `nvstreamdemux` to split batches and output separate buffer/streams",
+    )
+    parser.add_argument(
+        "-i",
+        "--input",
+        help="Path to input streams",
+        nargs="+",
+        metavar="URIs",
+        default=["a"],
+        required=True,
+    )
+
+    args = parser.parse_args()
+    stream_paths = args.input
+    return stream_paths
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    stream_paths = parse_args()
+    sys.exit(main(stream_paths))
