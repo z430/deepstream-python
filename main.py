@@ -3,6 +3,9 @@ import sys
 import gi
 import argparse
 import signal
+from functools import partial
+from inspect import signature
+from typing import List
 from ctypes import *
 
 gi.require_version("Gst", "1.0")
@@ -10,6 +13,8 @@ from gi.repository import Gst
 from gi.repository import GLib
 
 import pyds
+from datetime import datetime
+import pytz
 
 MUXER_OUTPUT_WIDTH = 540
 MUXER_OUTPUT_HEIGHT = 540  # 1080
@@ -18,8 +23,7 @@ from libs.platform import PlatformInfo
 import platform
 
 import cv2
-from datetime import datetime
-import pytz
+import numpy as np
 
 target_classes = [1]
 PGIE_CLASS_ID_PERSON = 0
@@ -55,35 +59,44 @@ def tiler_sink_pad_buffer_probe(pad, info, u_data):
         l_obj = frame_meta.obj_meta_list
         num_rects = frame_meta.num_obj_meta
 
-        while l_obj is not None:
-            try:
-                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
-            except StopIteration:
-                break
+        # Get the GPU memory frame (surface)
+        image = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+        timezone = pytz.timezone("Asia/Tokyo")
+        timestamp = datetime.now(timezone).strftime("%Y-%m-%d %H:%M:%S")
 
-            n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+        # Define the font and scale
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7
+        thickness = 2
+        color = (255, 255, 255)  # White text color
 
-            rect_params = obj_meta.rect_params
-            top = int(rect_params.top)
-            left = int(rect_params.left)
-            width = int(rect_params.width)
-            height = int(rect_params.height)
+        # Get the text size
+        text_size = cv2.getTextSize(timestamp, font, font_scale, thickness)[0]
 
-            x1 = left
-            y1 = top
-            x2 = left + width
-            y2 = top + height
+        # Set the position for the text (bottom right corner of the image)
+        text_x = image.shape[1] - text_size[0] - 10  # 10 pixels from the right
+        text_y = image.shape[0] - 10  # 10 pixels from the bottom
 
-            if obj_meta.class_id in target_classes:
-                bbox = n_frame[y1:y2, x1:x2]
-                n_frame[y1:y2, x1:x2] = cv2.GaussianBlur(bbox, (15, 15), 60)
+        # Create a black rectangle with opacity 0.6
+        overlay = image.copy()
+        cv2.rectangle(
+            overlay,
+            (text_x - 5, text_y - text_size[1] - 5),
+            (text_x + text_size[0] + 5, text_y + 5),
+            (0, 0, 0),
+            -1,
+        )
 
-            try:
-                l_obj = l_obj.next
-            except StopIteration:
-                break
+        # Apply opacity to the rectangle
+        alpha = 0.4
+        image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
 
-        print(f"Frame Number={frame_number} Number of Objects={num_rects}")
+        # Put the timestamp text on the image
+        cv2.putText(
+            image, timestamp, (text_x, text_y), font, font_scale, color, thickness
+        )
+
+        # print(f"Frame Number={frame_number} Number of Objects={num_rects}")
 
         try:
             l_frame = l_frame.next
@@ -91,6 +104,49 @@ def tiler_sink_pad_buffer_probe(pad, info, u_data):
             break
 
     return Gst.PadProbeReturn.OK
+
+
+def _anonymize_bbox(image, obj_meta, mode="blur"):
+    rect_params = obj_meta.rect_params
+    top = int(rect_params.top)
+    left = int(rect_params.left)
+    width = int(rect_params.width)
+    height = int(rect_params.height)
+
+    x1 = left
+    y1 = top
+    x2 = left + width
+    y2 = top + height
+
+    if mode == "blur":
+        bbox = image[y1:y2, x1:x2]
+        image[y1:y2, x1:x2] = cv2.GaussianBlur(bbox, (15, 15), 60)
+    elif mode == "pixelate":
+        reshape_factor = 18
+        min_dim = 16
+        bbox = image[y1:y2, x1:x2]
+        h, w, _ = bbox.shape
+        new_shape = (
+            max(min_dim, int(w / reshape_factor)),
+            max(min_dim, int(h / reshape_factor)),
+        )
+        bbox = cv2.resize(bbox, new_shape, interpolation=cv2.INTER_LINEAR)
+        image[y1:y2, x1:x2] = cv2.resize(bbox, (w, h), interpolation=cv2.INTER_NEAREST)
+    elif mode == "fill":
+        image = cv2.rectangle(image, (x1, y1), (x2, y2), color=(0, 0, 0), thickness=-1)
+    else:
+        raise ValueError(f"Invalid anonymization mode '{mode}'.")
+
+    return image
+
+
+def _anonymize(frames, _, l_frame_meta: List, ll_obj_meta: List[List]):
+    for frame, frame_meta, l_obj_meta in zip(frames, l_frame_meta, ll_obj_meta):
+        for obj_meta in l_obj_meta:
+            if target_classes and obj_meta.class_id not in target_classes:
+                continue
+
+            frame = _anonymize_bbox(frame, obj_meta)
 
 
 def bus_call(bus, message, loop):
@@ -236,29 +292,85 @@ def signal_handler(sig, frame, pipeline, loop):
     )  # Quit the loop after waiting a bit for EOS
 
 
-def create_splitmuxsink(camera_number, split_duration_seconds):
-    # Create the splitmuxsink element for handling file rotation
-    splitmuxsink = Gst.ElementFactory.make(
-        "splitmuxsink", f"splitmuxsink_camera_{camera_number}"
-    )
+def _probe_fn_wrapper(_, info, probe_fn, get_frames=False):
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        print("Unable to get GstBuffer")
+        return
 
-    if not splitmuxsink:
-        sys.stderr.write(f"Unable to create splitmuxsink for camera {camera_number}\n")
-        return None
+    frames = []
+    l_frame_meta = []
+    ll_obj_meta = []
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    l_frame = batch_meta.frame_meta_list
+    while l_frame is not None:
+        try:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        except StopIteration:
+            break
 
-    # Set the location format for the file names (camera number + timestamp)
-    # Example: camera-1-YYYYMMDDTHHMMSS.mp4
-    location_pattern = f"outputs/camera-{camera_number}-%Y%m%dT%H%M%S.mp4"
-    splitmuxsink.set_property("location", location_pattern)
+        if get_frames:
+            frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+            frames.append(frame)
 
-    # Set the duration for each segment in nanoseconds (1 second = 1,000,000,000 nanoseconds)
-    split_duration_nanoseconds = split_duration_seconds * Gst.SECOND
-    splitmuxsink.set_property("max-size-time", split_duration_nanoseconds)
+        l_frame_meta.append(frame_meta)
+        l_obj_meta = []
 
-    # Set the file format to MP4
-    splitmuxsink.set_property("muxer", Gst.ElementFactory.make("mp4mux", None))
+        l_obj = frame_meta.obj_meta_list
+        while l_obj is not None:
+            try:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+            except StopIteration:
+                break
 
-    return splitmuxsink
+            l_obj_meta.append(obj_meta)
+
+            try:
+                l_obj = l_obj.next
+            except StopIteration:
+                break
+
+        ll_obj_meta.append(l_obj_meta)
+
+        try:
+            l_frame = l_frame.next
+        except StopIteration:
+            break
+
+    if get_frames:
+        probe_fn(frames, batch_meta, l_frame_meta, ll_obj_meta)
+    else:
+        probe_fn(batch_meta, l_frame_meta, ll_obj_meta)
+
+    return Gst.PadProbeReturn.OK
+
+
+def _wrap_probe(probe_fn):
+    get_frames = "frames" in signature(probe_fn).parameters
+    return partial(_probe_fn_wrapper, probe_fn=probe_fn, get_frames=get_frames)
+
+
+def _get_static_pad(element, pad_name: str = "sink"):
+    pad = element.get_static_pad(pad_name)
+    if not pad:
+        raise AttributeError(f"Unable to get {pad_name} pad of {element.name}")
+
+    return pad
+
+
+def _add_probes(element, func):
+    _sinkpad = _get_static_pad(element, pad_name="src")
+    _sinkpad.add_probe(Gst.PadProbeType.BUFFER, _wrap_probe(func))
+
+
+def format_location_full_callback(splitmuxsink, fragment_id, first_sample, data):
+    # Custom filename format based on fragment number and timestamp
+    camera_index, output_location = data
+    timezone = pytz.timezone("Asia/Tokyo")
+    timestamp = datetime.now(timezone).strftime("%Y%m%dT%H%M%S")
+    filename = f"{output_location}/camera_{camera_index:02d}-{timestamp}.mp4"
+    print(f"Saving file: {filename}")
+    return filename
 
 
 def main(args):
@@ -379,30 +491,39 @@ def main(args):
         pipeline.add(codeparser)
 
         # Create muxer
-        muxer = Gst.ElementFactory.make("qtmux", f"muxer_{i}")
-        pipeline.add(muxer)
+        # muxer = Gst.ElementFactory.make("qtmux", f"muxer_{i}")
+        # pipeline.add(muxer)
 
-        # Create filesink
-        sink = Gst.ElementFactory.make("filesink", f"sink_{i}")
-        timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-        sink.set_property("location", f"outputs/camera_{i}-{timestamp}.mp4")
-        sink.set_property("sync", 0)
-        sink.set_property("async", 0)
-        pipeline.add(sink)
-        # sink = create_splitmuxsink(i, 60)
-        # sink = Gst.ElementFactory.make("splitmuxsink", f"sink_{i}")
-        # print(sink)
+        # # Create filesink
+        # sink = Gst.ElementFactory.make("filesink", f"sink_{i}")
+        # sink.set_property("location", f"outputs/output_{i}.mp4")
+        # sink.set_property("sync", 1)
+        # sink.set_property("async", 0)
         # pipeline.add(sink)
+
+        # Create splitmuxsink
+        output_location = "outputs"
+        splitmuxsink = Gst.ElementFactory.make("splitmuxsink", f"splitmuxsink_{i}")
+        if not splitmuxsink:
+            sys.stderr.write(" Unable to create splitmuxsink \n")
+        splitmuxsink.set_property("muxer", Gst.ElementFactory.make("mp4mux", None))
+        N = 120  # 2 minutes
+        splitmuxsink.set_property("max-size-time", N * Gst.SECOND)
+        # splitmuxsink.set_property("sync", True)
+        splitmuxsink.set_property("async-finalize", True)
+        splitmuxsink.connect(
+            "format-location-full", format_location_full_callback, (i, output_location)
+        )
+        pipeline.add(splitmuxsink)
 
         # Link the elements
         queue.link(videoconvert)
         videoconvert.link(filter)
         filter.link(encoder)
         encoder.link(codeparser)
-        codeparser.link(muxer)
-        muxer.link(sink)
+        codeparser.link(splitmuxsink)
 
-        tiler_sink_pad = queue.get_static_pad("src")
+        tiler_sink_pad = queue.get_static_pad("sink")
         if not tiler_sink_pad:
             sys.stderr.write(" Unable to get src pad \n")
         else:
@@ -419,10 +540,16 @@ def main(args):
             sys.stderr.write(f"Unable to get sink pad for queue_{i}\n")
         src_pad.link(sink_pad)
 
+        # if not is_aarch64:
+        #     mem_type = int(pyds.NVBUF_MEM_CUDA_UNIFIED)
+        #     videoconvert.set_property("nvbuf-memory-type", mem_type)
+
     if not is_aarch64():
         # Use CUDA unified memory so frames can be easily accessed on CPU in Python.
         mem_type = int(pyds.NVBUF_MEM_CUDA_UNIFIED)
         nvvidconv.set_property("nvbuf-memory-type", mem_type)
+
+    _add_probes(capsfilter, _anonymize)
 
     # create an event loop and feed gstreamer bus mesages to it
     loop = GLib.MainLoop()
