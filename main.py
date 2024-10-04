@@ -21,9 +21,9 @@ MUXER_OUTPUT_HEIGHT = 540  # 1080
 MUXER_BATCH_TIMEOUT_USEC = 33000
 from libs.platform import PlatformInfo
 import platform
+from libs.FPS import FPSMonitor
 
 import cv2
-import numpy as np
 
 target_classes = [1]
 PGIE_CLASS_ID_PERSON = 0
@@ -32,12 +32,14 @@ PGIE_CLASS_ID_HEAD = 1
 pgie_classes_str = ["Person", "Head"]
 platform_info = PlatformInfo()
 
+fps_streams = {}
+
 
 def is_aarch64():
     return platform.uname()[4] == "aarch64"
 
 
-def tiler_sink_pad_buffer_probe(pad, info, u_data):
+def timestamp_probe(pad, info, u_data):
     frame_number = 0
     num_rects = 0
     gst_buffer = info.get_buffer()
@@ -96,7 +98,7 @@ def tiler_sink_pad_buffer_probe(pad, info, u_data):
             image, timestamp, (text_x, text_y), font, font_scale, color, thickness
         )
 
-        # print(f"Frame Number={frame_number} Number of Objects={num_rects}")
+        fps_streams["stream{0}".format(frame_meta.pad_index)].get_fps()
 
         try:
             l_frame = l_frame.next
@@ -160,7 +162,7 @@ def bus_call(bus, message, loop):
     elif t == Gst.MessageType.ERROR:
         err, debug = message.parse_error()
         sys.stderr.write("Error: %s: %s\n" % (err, debug))
-        loop.quit()
+        # loop.quit()
     return True
 
 
@@ -245,7 +247,11 @@ def create_source_bin(index, uri):
     # Source element for reading from the uri.
     # We will use decodebin and let it figure out the container format of the
     # stream and the codec and plug the appropriate demux and decode plugins.
-    uri_decode_bin = Gst.ElementFactory.make("uridecodebin", "uri-decode-bin")
+    # uri_decode_bin = Gst.ElementFactory.make("uridecodebin", "uri-decode-bin")
+    uri_decode_bin = Gst.ElementFactory.make("nvurisrcbin", "uri-decode-bin-{index}")
+    uri_decode_bin.set_property("rtsp-reconnect-interval", 10)
+    uri_decode_bin.set_property("latency", 200)
+    # uri_decode_bin.set_property("cudadec-memtype", 0)
     if not uri_decode_bin:
         sys.stderr.write(" Unable to create uri decode bin \n")
     # We set the input uri to the source element
@@ -368,7 +374,7 @@ def format_location_full_callback(splitmuxsink, fragment_id, first_sample, data)
     camera_index, output_location = data
     timezone = pytz.timezone("Asia/Tokyo")
     timestamp = datetime.now(timezone).strftime("%Y%m%dT%H%M%S")
-    filename = f"{output_location}/camera_{camera_index:02d}-{timestamp}.mp4"
+    filename = f"{output_location}/camera_{camera_index+1:02d}-{timestamp}.mp4"
     print(f"Saving file: {filename}")
     return filename
 
@@ -377,6 +383,8 @@ def main(args):
     input_sources = args
     number_sources = len(input_sources)
 
+    for i in range(number_sources):
+        fps_streams[f"stream{i}"] = FPSMonitor(i)
     Gst.init(None)
 
     # Create gstreamer elements */
@@ -490,17 +498,6 @@ def main(args):
         )
         pipeline.add(codeparser)
 
-        # Create muxer
-        # muxer = Gst.ElementFactory.make("qtmux", f"muxer_{i}")
-        # pipeline.add(muxer)
-
-        # # Create filesink
-        # sink = Gst.ElementFactory.make("filesink", f"sink_{i}")
-        # sink.set_property("location", f"outputs/output_{i}.mp4")
-        # sink.set_property("sync", 1)
-        # sink.set_property("async", 0)
-        # pipeline.add(sink)
-
         # Create splitmuxsink
         output_location = "outputs"
         splitmuxsink = Gst.ElementFactory.make("splitmuxsink", f"splitmuxsink_{i}")
@@ -508,9 +505,13 @@ def main(args):
             sys.stderr.write(" Unable to create splitmuxsink \n")
         splitmuxsink.set_property("muxer", Gst.ElementFactory.make("mp4mux", None))
         N = 120  # 2 minutes
-        splitmuxsink.set_property("max-size-time", N * Gst.SECOND)
-        # splitmuxsink.set_property("sync", True)
         splitmuxsink.set_property("async-finalize", True)
+        splitmuxsink.set_property("max-size-time", N * Gst.SECOND)
+        # splitmuxsink.set_property("sink", "filesink")
+        # splitmuxsink.set_property("sync", True)
+        sink_props = Gst.Structure.new_empty("properties")
+        sink_props.set_value("sync", True)
+        splitmuxsink.set_property("sink-properties", sink_props)
         splitmuxsink.connect(
             "format-location-full", format_location_full_callback, (i, output_location)
         )
@@ -523,13 +524,11 @@ def main(args):
         encoder.link(codeparser)
         codeparser.link(splitmuxsink)
 
-        tiler_sink_pad = queue.get_static_pad("sink")
-        if not tiler_sink_pad:
+        queue_sink_pad = queue.get_static_pad("sink")
+        if not queue_sink_pad:
             sys.stderr.write(" Unable to get src pad \n")
         else:
-            tiler_sink_pad.add_probe(
-                Gst.PadProbeType.BUFFER, tiler_sink_pad_buffer_probe, 0
-            )
+            queue_sink_pad.add_probe(Gst.PadProbeType.BUFFER, timestamp_probe, 0)
 
         # Link nvstreamdemux to queue
         src_pad = nvdemux.request_pad_simple(f"src_{i}")

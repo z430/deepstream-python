@@ -10,8 +10,16 @@ ENV CUDA_VER=12.2
 RUN mkdir /app
 WORKDIR /app
 
-RUN apt update
-RUN apt install -y python3-gi python3-dev python3-gst-1.0 python3-numpy python3-opencv
+RUN apt-get update \
+    && apt-get install -y --allow-downgrades --allow-change-held-packages \
+    --no-install-recommends build-essential ca-certificates libsm6 libxext6 curl \
+    'libsm6' 'libxext6' git build-essential cmake pkg-config unzip yasm git \
+    checkinstall libjpeg-dev libpng-dev libtiff-dev libunistring-dev libx265-dev \
+    libnuma-dev libavcodec-dev libavformat-dev libswscale-dev libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev libxvidcore-dev x264 libx264-dev libfaac-dev \
+    libmp3lame-dev libtheora-dev libfaac-dev libmp3lame-dev libvorbis-dev \
+    libgtk-3-dev libatlas-base-dev gfortran libtool libc6 libc6-dev wget \
+    libnuma-dev libgtk2.0-dev libgstrtspserver-1.0-dev gstreamer1.0-rtsp sudo tmux
 
 # Compile Python bindings
 RUN apt install python3-gi python3-dev python3-gst-1.0 python-gi-dev git \
@@ -33,3 +41,12 @@ RUN mkdir /home/cogai/ \
     && apt-get install libgstrtspserver-1.0 libgstreamer1.0-dev \
     && cd gst-rtsp-server/examples \
     && gcc test-launch.c -o test-launch $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-rtsp-server-1.0)
+
+RUN cd /app \
+    && git clone https://github.com/FFmpeg/FFmpeg.git \
+    && cd FFmpeg \
+    && ./configure --enable-shared --disable-lzma \
+    && make -j12 \
+    && make install
+
+WORKDIR /workspace
