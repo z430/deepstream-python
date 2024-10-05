@@ -29,6 +29,7 @@ class AnonymizationPipeline(Pipeline):
         y1 = top
         x2 = left + width
         y2 = top + height
+        print(image.shape)
 
         if mode == "blur":
             bbox = image[y1:y2, x1:x2]

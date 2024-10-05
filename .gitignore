@@ -127,3 +127,6 @@ dmypy.json
 
 /.idea/
 app/output/
+outputs/
+run_server*
+*.mp4

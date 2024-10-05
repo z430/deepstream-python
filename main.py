@@ -552,7 +552,7 @@ def main(args):
     )
     pipeline.set_state(Gst.State.PLAYING)
     signal.signal(
-        signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, nvdemux, loop)
+        signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, queue1, loop)
     )
 
     try:
