@@ -9,7 +9,6 @@ from gi.repository import Gst
 import cv2
 from loguru import logger
 import pyds
-from libs.probe import add_probes
 
 
 def get_timestamp() -> str:
@@ -52,7 +51,7 @@ def render_timestamp(image, timestamp):
 def timestamp_probe(pad, info, u_data):
     gst_buffer = info.get_buffer()
     if not gst_buffer:
-        print("Unable to get GstBuffer")
+        logger.error("Unable to get GstBuffer")
         return Gst.PadProbeReturn.OK
 
     # Retrieve batch metadata from the gst_buffer
@@ -84,7 +83,7 @@ def format_location_full_callback(splitmuxsink, fragment_id, first_sample, data)
     timezone = pytz.timezone("Asia/Tokyo")
     timestamp = datetime.now(timezone).strftime("%Y%m%dT%H%M%S")
     filename = f"{output_location}/camera_{camera_index+1:02d}-{timestamp}.mp4"
-    print(f"Saving file: {filename}")
+    logger.info(f"Saving file: {filename}")
     return filename
 
 

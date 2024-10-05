@@ -1,6 +1,5 @@
 import cv2
 from typing import List
-from libs.probe import add_probes
 
 TARGET_CLASSES = [1]
 
@@ -46,7 +45,3 @@ def _anonymize(frames, _, l_frame_meta: List, ll_obj_meta: List[List]):
                 continue
 
             frame = _anonymize_bbox(frame, obj_meta)
-
-
-def add_anonymization_probe(element):
-    add_probes(element, _anonymize)

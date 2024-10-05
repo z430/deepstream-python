@@ -15,9 +15,7 @@ def cb_newpad(decodebin, decoder_src_pad, data):
     source_bin = data
     features = caps.get_features(0)
 
-    print("gstname=", gstname)
     if gstname.find("video") != -1:
-        print("features=", features)
         if features.contains("memory:NVMM"):
             bin_ghost_pad = source_bin.get_static_pad("src")
             if not bin_ghost_pad.set_target(decoder_src_pad):
