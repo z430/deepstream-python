@@ -167,35 +167,19 @@ def bus_call(bus, message, loop):
 
 
 def cb_newpad(decodebin, decoder_src_pad, data):
-    """
-    The function is called when a new pad is created by the decodebin.
-    The function checks if the new pad is for video and not audio.
-    If the new pad is for video, the function checks if the pad caps contain NVMM memory features.
-    If the pad caps contain NVMM memory features, the function links the decodebin pad to the source bin
-    ghost pad.
-    If the pad caps do not contain NVMM memory features, the function prints an error message.
-    :param decodebin: The decodebin element that is creating the new pad
-    :param decoder_src_pad: The source pad created by the decodebin element
-    :param data: This is the data that was passed to the callback function. In this case, it is the
-    source_bin
-    """
     print("In cb_newpad\n")
     caps = decoder_src_pad.get_current_caps()
+    if not caps:
+        caps = decoder_src_pad.query_caps()
     gststruct = caps.get_structure(0)
     gstname = gststruct.get_name()
     source_bin = data
     features = caps.get_features(0)
 
-    # Need to check if the pad created by the decodebin is for video and not
-    # audio.
     print("gstname=", gstname)
     if gstname.find("video") != -1:
-        # Link the decodebin pad only if decodebin has picked nvidia
-        # decoder plugin nvdec_*. We do this by checking if the pad caps contain
-        # NVMM memory features.
         print("features=", features)
         if features.contains("memory:NVMM"):
-            # Get the source bin ghost pad
             bin_ghost_pad = source_bin.get_static_pad("src")
             if not bin_ghost_pad.set_target(decoder_src_pad):
                 sys.stderr.write(
@@ -248,9 +232,9 @@ def create_source_bin(index, uri):
     # We will use decodebin and let it figure out the container format of the
     # stream and the codec and plug the appropriate demux and decode plugins.
     # uri_decode_bin = Gst.ElementFactory.make("uridecodebin", "uri-decode-bin")
-    uri_decode_bin = Gst.ElementFactory.make("nvurisrcbin", "uri-decode-bin-{index}")
+    uri_decode_bin = Gst.ElementFactory.make("nvurisrcbin", "uri-decode-bin")
     uri_decode_bin.set_property("rtsp-reconnect-interval", 10)
-    uri_decode_bin.set_property("latency", 200)
+    # uri_decode_bin.set_property("latency", 0)
     # uri_decode_bin.set_property("cudadec-memtype", 0)
     if not uri_decode_bin:
         sys.stderr.write(" Unable to create uri decode bin \n")
@@ -568,7 +552,7 @@ def main(args):
     )
     pipeline.set_state(Gst.State.PLAYING)
     signal.signal(
-        signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, pipeline, loop)
+        signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, nvdemux, loop)
     )
 
     try:
