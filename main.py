@@ -17,7 +17,8 @@ from loguru import logger
 from libs.platform import PlatformInfo
 from libs.input_handler import build_source_bin
 from libs.demux_pipeline import demux_pipeline
-from libs.face_blur import add_anonymization_probe
+from libs.face_blur import _anonymize
+from libs.probe import Probe
 
 MUXER_BATCH_TIMEOUT_USEC = 33000
 platform_info = PlatformInfo()
@@ -59,6 +60,7 @@ def signal_handler(sig, frame, pipeline, loop):
 def main(args):
     input_sources = args
     number_sources = len(input_sources)
+    probe = Probe(number_sources)
 
     Gst.init(None)
 
@@ -117,7 +119,7 @@ def main(args):
     capsfilter.link(nvdemux)
 
     demux_pipeline(pipeline, nvdemux, number_sources)
-    add_anonymization_probe(capsfilter)
+    probe.add_probes(capsfilter, _anonymize)
 
     if not platform_info.is_platform_aarch64():
         # Use CUDA unified memory so frames can be easily accessed on CPU in Python.
