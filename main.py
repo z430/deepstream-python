@@ -180,11 +180,11 @@ def main(args):
     bus.connect("message", bus_call, loop)
 
     # Generate pipeline graph
-    open("pipeline.dot", "w").write(
+    open("outputs/pipeline.dot", "w").write(
         Gst.debug_bin_to_dot_data(pipeline, Gst.DebugGraphDetails.ALL)
     )
 
-    os.system("dot -Tpng pipeline.dot -o outputs/pipeline.png")
+    os.system("dot -Tpng outputs/pipeline.dot -o outputs/pipeline.png")
 
     logger.info("Now playing...")
     for i, source in enumerate(input_sources):

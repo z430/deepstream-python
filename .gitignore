@@ -130,4 +130,4 @@ app/output/
 outputs/
 run_server*
 *.mp4
-*.dot
+pipeline.dot
