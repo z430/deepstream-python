@@ -14,7 +14,7 @@ from gi.repository import GLib
 import pyds
 from loguru import logger
 
-from libs.platform import PlatformInfo
+from libs.platform import is_platform_aarch64
 from libs.input_handler import build_source_bin
 from libs.demux_pipeline import demux_pipeline
 from libs.face_blur import _anonymize
@@ -25,7 +25,6 @@ PGIE_CONFIG_PATH = "configs/pgies/yolov5.txt"
 IMAGE_WIDTH = 1920
 IMAGE_HEIGHT = 1080
 
-platform_info = PlatformInfo()
 
 ELEMENT_NAMES = {
     "streammux": "nvstreammux",
@@ -166,7 +165,7 @@ def main(args):
         pipeline.get_by_name(f"{ELEMENT_NAMES['capsfilter']}-1"), _anonymize
     )
 
-    if not platform_info.is_platform_aarch64():
+    if not is_platform_aarch64():
         # Use CUDA unified memory so frames can be easily accessed on CPU in Python.
         mem_type = int(pyds.NVBUF_MEM_CUDA_UNIFIED)
         pipeline.get_by_name(f"{ELEMENT_NAMES['nvvidconv']}-1").set_property(

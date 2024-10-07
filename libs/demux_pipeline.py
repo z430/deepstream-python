@@ -145,7 +145,7 @@ def demux_pipeline(pipeline, nvdemux, number_sources):
             queue_sink_pad.add_probe(Gst.PadProbeType.BUFFER, timestamp_probe, 0)
 
         # Link nvstreamdemux to queue
-        src_pad = nvdemux.request_pad_simple(f"src_{i}")
+        src_pad = nvdemux.get_request_pad(f"src_{i}")
         if not src_pad:
             logger.error(f"Unable to get src pad for stream {i}")
         sink_pad = queue.get_static_pad("sink")
