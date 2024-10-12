@@ -44,4 +44,15 @@ def _anonymize(frames, _, l_frame_meta: List, ll_obj_meta: List[List]):
             if TARGET_CLASSES and obj_meta.class_id not in TARGET_CLASSES:
                 continue
 
-            frame = _anonymize_bbox(frame, obj_meta)
+            rect_params = obj_meta.rect_params
+            top = int(rect_params.top)
+            left = int(rect_params.left)
+            width = int(rect_params.width)
+            height = int(rect_params.height)
+
+            x1 = left
+            y1 = top
+            x2 = left + width
+            y2 = top + height
+            bbox = frame[y1:y2, x1:x2]
+            frame[y1:y2, x1:x2] = cv2.GaussianBlur(bbox, (15, 15), 60)

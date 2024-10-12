@@ -1,12 +1,11 @@
-# FROM nvcr.io/nvidia/deepstream:7.0-triton-multiarch
-FROM nvcr.io/nvidia/deepstream:6.2-devel
+FROM nvcr.io/nvidia/deepstream:7.0-triton-multiarch
 
 # To get video driver libraries at runtime (libnvidia-encode.so/libnvcuvid.so)
 ENV NVIDIA_DRIVER_CAPABILITIES $NVIDIA_DRIVER_CAPABILITIES,video
 ENV LOGLEVEL="INFO"
 ENV GST_DEBUG=3
 ENV GST_DEBUG_FILE=/app/output/GST_DEBUG.log
-ENV CUDA_VER=11.8
+ENV CUDA_VER=12.2
 
 RUN mkdir /app
 WORKDIR /app
@@ -43,12 +42,12 @@ RUN mkdir /home/cogai/ \
     && cd gst-rtsp-server/examples \
     && gcc test-launch.c -o test-launch $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-rtsp-server-1.0)
 
-# RUN cd /app \
-#     && git clone https://github.com/FFmpeg/FFmpeg.git \
-#     && cd FFmpeg \
-#     && ./configure --enable-shared --disable-lzma \
-#     && make -j12 \
-#     && make install
+RUN cd /app \
+    && git clone https://github.com/FFmpeg/FFmpeg.git \
+    && cd FFmpeg \
+    && ./configure --enable-shared --disable-lzma \
+    && make -j12 \
+    && make install
 RUN /opt/nvidia/deepstream/deepstream/user_additional_install.sh
 
 WORKDIR /workspace
