@@ -27,8 +27,8 @@ RUN apt install python3-gi python3-dev python3-gst-1.0 python-gi-dev git \
     libglib2.0-dev-bin libgstreamer1.0-dev libtool m4 autoconf automake libgirepository1.0-dev libcairo2-dev -y \
     && apt-get install -y libgstrtspserver-1.0-0 gstreamer1.0-rtsp libgirepository1.0-dev gobject-introspection gir1.2-gst-rtsp-server-1.0
 
-RUN wget https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.1.6/pyds-1.1.6-py3-none-linux_x86_64.whl \
-    && pip3 install pyds-1.1.6-py3-none-linux_x86_64.whl
+RUN wget https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.1.11/pyds-1.1.11-py3-none-linux_x86_64.whl \
+    && pip3 install pyds-1.1.11-py3-none-linux_x86_64.whl
 
 RUN git clone https://github.com/marcoslucianops/DeepStream-Yolo.git \
     && cd DeepStream-Yolo \
@@ -42,12 +42,12 @@ RUN mkdir /home/cogai/ \
     && cd gst-rtsp-server/examples \
     && gcc test-launch.c -o test-launch $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-rtsp-server-1.0)
 
-RUN cd /app \
-    && git clone https://github.com/FFmpeg/FFmpeg.git \
-    && cd FFmpeg \
-    && ./configure --enable-shared --disable-lzma \
-    && make -j12 \
-    && make install
+# RUN cd /app \
+#     && git clone https://github.com/FFmpeg/FFmpeg.git \
+#     && cd FFmpeg \
+#     && ./configure --enable-shared --disable-lzma \
+#     && make -j12 \
+#     && make install
 RUN /opt/nvidia/deepstream/deepstream/user_additional_install.sh
 
 WORKDIR /workspace
