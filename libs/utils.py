@@ -1,4 +1,5 @@
 import gi
+import yaml
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
@@ -37,3 +38,9 @@ def signal_handler(sig, frame, element, loop):
     GLib.timeout_add(
         5000, lambda: loop.quit()
     )  # Quit the loop after waiting a bit for EOS
+
+
+def load_config(config_path):
+    with open(config_path, "r") as file:
+        config = yaml.safe_load(file)
+    return config

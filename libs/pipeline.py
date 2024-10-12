@@ -117,6 +117,7 @@ class Pipeline:
     def run(self):
         logger.info("Starting pipeline")
         logger.info(self.elements)
+
         # create an event loop and feed gstreamer bus mesages to it
         loop = GLib.MainLoop()
         bus = self.pipeline.get_bus()
@@ -131,8 +132,6 @@ class Pipeline:
         os.system("dot -Tpng outputs/pipeline.dot -o outputs/pipeline.png")
 
         logger.info("Now playing...")
-
-        logger.info("Starting pipeline")
         self.pipeline.set_state(Gst.State.PLAYING)
 
         # handler for keyboard interrupt
