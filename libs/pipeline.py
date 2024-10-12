@@ -1,21 +1,17 @@
-import argparse
 import os
-import signal
 import sys
-from typing import List, Dict
-from ctypes import *
+import signal
+from typing import Dict, List
 
 import gi
 
 gi.require_version("Gst", "1.0")
-from gi.repository import GLib, Gst
-
-from loguru import logger
 import pyds
-
-from libs.platform import is_platform_aarch64
-from libs.utils import gst_log_handler
+from gi.repository import Gst, GLib
 from libs.input_handler import build_source_bin
+from libs.platform import is_platform_aarch64
+from libs.utils import gst_log_handler, bus_call, signal_handler
+from loguru import logger
 
 
 class Pipeline:
@@ -121,3 +117,39 @@ class Pipeline:
     def run(self):
         logger.info("Starting pipeline")
         logger.info(self.elements)
+        # create an event loop and feed gstreamer bus mesages to it
+        loop = GLib.MainLoop()
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", bus_call, loop)
+
+        # Generate pipeline graph
+        open("outputs/pipeline.dot", "w").write(
+            Gst.debug_bin_to_dot_data(self.pipeline, Gst.DebugGraphDetails.ALL)
+        )
+
+        os.system("dot -Tpng outputs/pipeline.dot -o outputs/pipeline.png")
+
+        logger.info("Now playing...")
+
+        logger.info("Starting pipeline")
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+        # handler for keyboard interrupt
+        signal.signal(
+            signal.SIGINT,
+            lambda sig, frame: signal_handler(
+                sig,
+                frame,
+                self.pipeline.get_by_name("queue"),
+                loop,
+            ),
+        )
+
+        try:
+            loop.run()
+        except Exception as e:
+            logger.error(f"Exception: {e}")
+        finally:
+            logger.info("Exiting app")
+            self.pipeline.set_state(Gst.State.NULL)
